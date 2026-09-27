@@ -27,6 +27,7 @@ class ItemBody(Body):
 
 
 class CheckoutBody(Body):
+    coupon_code: str | None = Field(None, max_length=64)
     # Optional guard: if the total at checkout differs, fail instead of charging it.
     expected_total_cents: StrictInt | None = Field(None, ge=0)
 
@@ -62,7 +63,7 @@ def remove_item(cart_id: str, product_id: str, request: Request):
 @router.post("/carts/{cart_id}/checkout", status_code=201)
 def checkout(cart_id: str, request: Request, body: CheckoutBody | None = None):
     body = body or CheckoutBody()
-    order, replayed = store(request).checkout(cart_id, body.expected_total_cents)
+    order, replayed = store(request).checkout(cart_id, body.coupon_code, body.expected_total_cents)
     if replayed:
         return JSONResponse(order, headers={"Idempotent-Replayed": "true"})
     return JSONResponse(order, status_code=201)
@@ -71,6 +72,19 @@ def checkout(cart_id: str, request: Request, body: CheckoutBody | None = None):
 @router.get("/orders/{order_id}")
 def get_order(order_id: str, request: Request):
     return store(request).get_order(order_id)
+
+
+# ---- admin (no auth by design; every /admin route is an operator action) ----
+
+
+@router.post("/admin/coupons", status_code=201)
+def generate_coupon(request: Request):
+    return store(request).generate_coupon()
+
+
+@router.get("/admin/coupons")
+def list_coupons(request: Request):
+    return store(request).list_coupons()
 
 
 # ---- errors -------------------------------------------------------------
@@ -110,12 +124,15 @@ def on_unexpected(request, exc: Exception):
     return error(500, "INTERNAL_ERROR", "Unexpected server error.")
 
 
-def create_app(db_path: str | None = None) -> FastAPI:
+def create_app(db_path: str | None = None, every_n: int | None = None,
+               percent: int | None = None) -> FastAPI:
     db_path = db_path or os.environ.get("DB_PATH", "store.db")
+    every_n = every_n if every_n is not None else int(os.environ.get("COUPON_EVERY_N", "5"))
+    percent = percent if percent is not None else int(os.environ.get("COUPON_PERCENT", "10"))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.store = Store(db_path)  # creates schema and seeds on first run
+        app.state.store = Store(db_path, every_n, percent)  # creates schema, seeds on first run
         yield
 
     app = FastAPI(title="Checkout & Rewards Service", lifespan=lifespan)

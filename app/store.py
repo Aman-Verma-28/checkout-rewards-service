@@ -1,4 +1,5 @@
 """Domain logic. Every public method is exactly one database transaction."""
+import secrets
 import uuid
 from datetime import datetime, timezone
 
@@ -21,9 +22,16 @@ def _id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
+def discount_cents(subtotal_cents: int, percent: int) -> int:
+    """percent% of the subtotal, rounded down to the cent. Integer math, never above the subtotal."""
+    return min(subtotal_cents, subtotal_cents * percent // 100)
+
+
 class Store:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
+    def __init__(self, db_path: str, every_n: int, percent: int):
+        if every_n < 1 or not 1 <= percent <= 100:
+            raise ValueError("need every_n >= 1 and 1 <= percent <= 100")
+        self.db_path, self.every_n, self.percent = db_path, every_n, percent
         db.init(db_path)
 
     def _write(self):
@@ -101,27 +109,29 @@ class Store:
         order = conn.execute("SELECT id FROM orders WHERE cart_id = ?", (cart_id,)).fetchone()
         if order is None:
             raise ApiError(404, "CART_NOT_FOUND", f"Cart {cart_id!r} does not exist.")
-        raise ApiError(
-            409, "CART_ALREADY_CHECKED_OUT", "Cart is already checked out and can no longer change.",
-            order_id=order["id"],
-        )
+        raise ApiError(409, "CART_ALREADY_CHECKED_OUT", "Cart is already checked out.",
+                       order_id=order["id"])
 
     # ---- checkout -------------------------------------------------------
 
-    def checkout(self, cart_id: str, expected_total_cents: int | None = None) -> tuple[dict, bool]:
+    def checkout(self, cart_id: str, coupon_code: str | None = None,
+                 expected_total_cents: int | None = None) -> tuple[dict, bool]:
         """Place the order for a cart. Returns (order, replayed).
 
-        One transaction: the cart state change, stock decrements and order snapshot all
-        commit together or not at all, so a failed checkout leaves no trace.
-        The cart is the idempotency key: retrying a checked-out cart returns its order.
+        One transaction: the cart state change, stock decrements, coupon redemption and
+        order snapshot all commit together or not at all, so a failed checkout leaves no
+        trace and never consumes a coupon.
+        The cart is the idempotency key: retrying a checked-out cart with the same coupon
+        returns its order.
         """
+        code = (coupon_code or "").strip().upper() or None
         with self._write() as conn:
             claimed = conn.execute(
                 "UPDATE carts SET status = 'checked_out', updated_at = ? WHERE id = ? AND status = 'open'",
                 (_now(), cart_id),
             ).rowcount
             if not claimed:
-                return self._replay(conn, cart_id), True
+                return self._replay(conn, cart_id, code), True
 
             lines = conn.execute(
                 """SELECT i.product_id, p.name, p.price_cents, p.inventory, i.quantity
@@ -140,7 +150,8 @@ class Store:
                                "Some items no longer have enough inventory.", items=short)
 
             subtotal = sum(l["price_cents"] * l["quantity"] for l in lines)
-            discount = 0
+            percent = self._redeemable_percent(conn, code) if code else 0
+            discount = discount_cents(subtotal, percent)
             total = subtotal - discount
             if expected_total_cents is not None and expected_total_cents != total:
                 raise ApiError(409, "PRICE_CHANGED",
@@ -148,10 +159,12 @@ class Store:
                                expected_total_cents=expected_total_cents, total_cents=total)
 
             order_id = _id("ord")
+            # orders.coupon_code is UNIQUE: inserting the order *is* the redemption.
             conn.execute(
-                """INSERT INTO orders (id, cart_id, subtotal_cents, discount_cents, total_cents, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (order_id, cart_id, subtotal, discount, total, _now()),
+                """INSERT INTO orders (id, cart_id, coupon_code, discount_percent,
+                                       subtotal_cents, discount_cents, total_cents, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (order_id, cart_id, code, percent, subtotal, discount, total, _now()),
             )
             for l in lines:
                 # Conditional decrement: correct even without the IMMEDIATE lock (e.g. on
@@ -173,11 +186,69 @@ class Store:
                 )
             return self._order_view(conn, order_id), False
 
-    def _replay(self, conn, cart_id: str) -> dict:
-        order = conn.execute("SELECT id FROM orders WHERE cart_id = ?", (cart_id,)).fetchone()
-        if order is None:
+    def _replay(self, conn, cart_id: str, code: str | None) -> dict:
+        order = conn.execute(
+            "SELECT id, coupon_code FROM orders WHERE cart_id = ?", (cart_id,)
+        ).fetchone()
+        # Same cart + same coupon = the same request retried. A different coupon is a
+        # different request for a cart that is already spent.
+        if order is None or order["coupon_code"] != code:
             self._raise_cart_unavailable(conn, cart_id)
         return self._order_view(conn, order["id"])
+
+    def _redeemable_percent(self, conn, code: str) -> int:
+        coupon = conn.execute(
+            """SELECT c.percent, o.id AS order_id
+               FROM coupons c LEFT JOIN orders o ON o.coupon_code = c.code WHERE c.code = ?""",
+            (code,),
+        ).fetchone()
+        if coupon is None:
+            raise ApiError(422, "COUPON_NOT_FOUND", f"Coupon {code!r} does not exist.")
+        if coupon["order_id"] is not None:
+            raise ApiError(409, "COUPON_ALREADY_REDEEMED", f"Coupon {code!r} has already been used.")
+        return coupon["percent"]
+
+    # ---- coupons --------------------------------------------------------
+
+    def generate_coupon(self) -> dict:
+        """Issue the coupon for the oldest milestone that has been reached but not rewarded."""
+        with self._write() as conn:
+            placed = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+            last = conn.execute("SELECT COALESCE(MAX(milestone), 0) FROM coupons").fetchone()[0]
+            milestone = last + self.every_n
+            if placed < milestone:
+                raise ApiError(409, "NO_ELIGIBLE_MILESTONE",
+                               "No order milestone is waiting for a coupon.",
+                               orders_placed=placed, next_milestone=milestone)
+            code = f"SAVE{self.percent}-{secrets.token_hex(5).upper()}"
+            conn.execute(
+                "INSERT INTO coupons (code, milestone, percent, created_at) VALUES (?, ?, ?, ?)",
+                (code, milestone, self.percent, _now()),
+            )
+            return self._coupons(conn, "WHERE c.code = ?", (code,))[0]
+
+    def list_coupons(self) -> list[dict]:
+        with self._read() as conn:
+            return self._coupons(conn)
+
+    def _coupons(self, conn, where: str = "", params: tuple = ()) -> list[dict]:
+        rows = conn.execute(
+            f"""SELECT c.code, c.milestone, c.percent, c.created_at, o.id AS order_id
+                FROM coupons c LEFT JOIN orders o ON o.coupon_code = c.code
+                {where} ORDER BY c.milestone""",
+            params,
+        )
+        return [
+            {
+                "code": r["code"],
+                "milestone": r["milestone"],  # earned when this many orders had been placed
+                "percent": r["percent"],
+                "status": "redeemed" if r["order_id"] else "available",
+                "redeemed_by_order_id": r["order_id"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
 
     # ---- orders ---------------------------------------------------------
 
