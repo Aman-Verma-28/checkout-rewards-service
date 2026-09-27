@@ -4,6 +4,7 @@ Every invariant has a constraint here as the last line of defence, so a bug in
 application code fails loudly instead of corrupting data.
 """
 import sqlite3
+import time
 from contextlib import contextmanager
 
 SCHEMA = """
@@ -78,16 +79,27 @@ def connect(path: str) -> sqlite3.Connection:
 
 
 def init(path: str) -> None:
-    conn = connect(path)
-    try:
-        conn.execute("PRAGMA journal_mode = WAL")  # readers never block the writer
-        conn.executescript(SCHEMA)
-        conn.executemany(
-            "INSERT OR IGNORE INTO products (id, name, price_cents, inventory) VALUES (?, ?, ?, ?)",
-            SEED_PRODUCTS,
-        )
-    finally:
-        conn.close()
+    """Create the schema and seed products. Idempotent, so it is safe to retry.
+
+    Several worker processes can boot against a new file at once. SQLite refuses (rather
+    than waits for) a lock upgrade that could deadlock, so a "locked" error here is retried.
+    """
+    for attempt in range(50):
+        conn = connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")  # readers never block the writer
+            conn.executescript(SCHEMA)
+            conn.executemany(
+                "INSERT OR IGNORE INTO products (id, name, price_cents, inventory) VALUES (?, ?, ?, ?)",
+                SEED_PRODUCTS,
+            )
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e) or attempt == 49:
+                raise
+            time.sleep(0.1)
+        finally:
+            conn.close()
 
 
 @contextmanager
