@@ -47,6 +47,21 @@ class Store:
             rows = conn.execute("SELECT id, name, price_cents, inventory FROM products ORDER BY id")
             return [dict(r) for r in rows]
 
+    def update_product(self, product_id: str, price_cents: int | None,
+                       inventory: int | None) -> dict:
+        """Admin: set price and/or stock. Only affects carts and future orders, never placed ones."""
+        with self._write() as conn:
+            updated = conn.execute(
+                """UPDATE products SET price_cents = COALESCE(?, price_cents),
+                                       inventory = COALESCE(?, inventory) WHERE id = ?""",
+                (price_cents, inventory, product_id),
+            ).rowcount
+            if not updated:
+                raise ApiError(404, "PRODUCT_NOT_FOUND", f"Product {product_id!r} does not exist.")
+            return dict(conn.execute(
+                "SELECT id, name, price_cents, inventory FROM products WHERE id = ?", (product_id,)
+            ).fetchone())
+
     # ---- carts ----------------------------------------------------------
 
     def create_cart(self) -> dict:
@@ -256,6 +271,12 @@ class Store:
         with self._read() as conn:
             return self._order_view(conn, order_id)
 
+    def list_orders(self) -> list[dict]:
+        with self._read() as conn:
+            ids = [r["id"] for r in conn.execute("SELECT id FROM orders ORDER BY created_at, id")]
+            # ponytail: one query per order; paginate and join once order volume matters.
+            return [self._order_view(conn, i) for i in ids]
+
     def _order_view(self, conn, order_id: str) -> dict:
         order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
         if order is None:
@@ -276,6 +297,49 @@ class Store:
             "discount_cents": order["discount_cents"],
             "total_cents": order["total_cents"],
             "created_at": order["created_at"],
+        }
+
+    # ---- reporting ------------------------------------------------------
+
+    def report(self) -> dict:
+        """Aggregates over orders and coupons, read from one snapshot. Never writes."""
+        with self._read() as conn:
+            products = conn.execute(
+                """SELECT p.id AS product_id, p.name,
+                          COALESCE(SUM(l.quantity), 0) AS quantity_sold,
+                          COALESCE(SUM(l.line_total_cents), 0) AS gross_revenue_cents
+                   FROM products p LEFT JOIN order_lines l ON l.product_id = p.id
+                   GROUP BY p.id ORDER BY p.id"""
+            ).fetchall()
+            orders = conn.execute(
+                """SELECT COUNT(*) AS placed,
+                          COALESCE(SUM(subtotal_cents), 0) AS gross,
+                          COALESCE(SUM(discount_cents), 0) AS discount,
+                          COALESCE(SUM(total_cents), 0) AS net
+                   FROM orders"""
+            ).fetchone()
+            coupons = conn.execute(
+                """SELECT COUNT(*) AS generated, COUNT(o.id) AS redeemed,
+                          COALESCE(MAX(c.milestone), 0) AS last_milestone
+                   FROM coupons c LEFT JOIN orders o ON o.coupon_code = c.code"""
+            ).fetchone()
+        return {
+            "orders_placed": orders["placed"],
+            "gross_revenue_cents": orders["gross"],
+            "total_discount_cents": orders["discount"],
+            "net_revenue_cents": orders["net"],
+            "products": [dict(r) for r in products],
+            "coupons": {
+                "generated": coupons["generated"],
+                "available": coupons["generated"] - coupons["redeemed"],
+                "redeemed": coupons["redeemed"],
+            },
+            "rewards": {
+                "every_n": self.every_n,
+                "percent": self.percent,
+                "next_milestone": coupons["last_milestone"] + self.every_n,
+                "milestones_awaiting_coupon": (orders["placed"] - coupons["last_milestone"]) // self.every_n,
+            },
         }
 
     # ---- views ----------------------------------------------------------

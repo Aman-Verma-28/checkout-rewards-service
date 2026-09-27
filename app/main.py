@@ -32,6 +32,11 @@ class CheckoutBody(Body):
     expected_total_cents: StrictInt | None = Field(None, ge=0)
 
 
+class ProductPatch(Body):
+    price_cents: StrictInt | None = Field(None, ge=0, le=100_000_000)
+    inventory: StrictInt | None = Field(None, ge=0, le=1_000_000)
+
+
 # ---- storefront ---------------------------------------------------------
 
 
@@ -85,6 +90,21 @@ def generate_coupon(request: Request):
 @router.get("/admin/coupons")
 def list_coupons(request: Request):
     return store(request).list_coupons()
+
+
+@router.get("/admin/orders")
+def list_orders(request: Request):
+    return store(request).list_orders()
+
+
+@router.get("/admin/report")
+def report(request: Request):
+    return store(request).report()
+
+
+@router.patch("/admin/products/{product_id}")
+def update_product(product_id: str, body: ProductPatch, request: Request):
+    return store(request).update_product(product_id, body.price_cents, body.inventory)
 
 
 # ---- errors -------------------------------------------------------------
