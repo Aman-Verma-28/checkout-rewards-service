@@ -40,15 +40,15 @@ def test_failed_checkout_keeps_the_coupon_and_the_stock(api):
 
 def test_price_change_before_checkout_is_caught_and_placed_orders_never_change(api):
     cart = cart_with(api, {"hoodie": 1})
-    seen_total = api.get(f"/carts/{cart}").json()["subtotal_cents"]
+    seen = api.get(f"/carts/{cart}").json()["subtotal_cents"]
     api.patch("/admin/products/hoodie", json={"price_cents": 5499})
 
-    r = api.post(f"/carts/{cart}/checkout", json={"expected_total_cents": seen_total})
+    r = api.post(f"/carts/{cart}/checkout", json={"expected_subtotal_cents": seen})
     assert r.status_code == 409 and error_code(r) == "PRICE_CHANGED"
-    assert r.json()["error"]["details"] == {"expected_total_cents": 4999, "total_cents": 5499}
+    assert r.json()["error"]["details"] == {"expected_subtotal_cents": 4999, "subtotal_cents": 5499}
     assert api.get(f"/carts/{cart}").json()["items"][0]["unit_price_cents"] == 5499
 
-    order = api.post(f"/carts/{cart}/checkout", json={"expected_total_cents": 5499}).json()
+    order = api.post(f"/carts/{cart}/checkout", json={"expected_subtotal_cents": 5499}).json()
     api.patch("/admin/products/hoodie", json={"price_cents": 1})
     assert api.get(f"/orders/{order['id']}").json() == order  # snapshot, not a live join
 

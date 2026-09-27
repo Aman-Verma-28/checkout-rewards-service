@@ -130,7 +130,7 @@ class Store:
     # ---- checkout -------------------------------------------------------
 
     def checkout(self, cart_id: str, coupon_code: str | None = None,
-                 expected_total_cents: int | None = None) -> tuple[dict, bool]:
+                 expected_subtotal_cents: int | None = None) -> tuple[dict, bool]:
         """Place the order for a cart. Returns (order, replayed).
 
         One transaction: the cart state change, stock decrements, coupon redemption and
@@ -165,13 +165,14 @@ class Store:
                                "Some items no longer have enough inventory.", items=short)
 
             subtotal = sum(l["price_cents"] * l["quantity"] for l in lines)
+            if expected_subtotal_cents is not None and expected_subtotal_cents != subtotal:
+                # Prices moved since the client last showed the cart: refuse rather than charge it.
+                raise ApiError(409, "PRICE_CHANGED",
+                               "Cart prices changed since the client last saw them.",
+                               expected_subtotal_cents=expected_subtotal_cents, subtotal_cents=subtotal)
             percent = self._redeemable_percent(conn, code) if code else 0
             discount = discount_cents(subtotal, percent)
             total = subtotal - discount
-            if expected_total_cents is not None and expected_total_cents != total:
-                raise ApiError(409, "PRICE_CHANGED",
-                               "The order total differs from the total the client expected.",
-                               expected_total_cents=expected_total_cents, total_cents=total)
 
             order_id = _id("ord")
             # orders.coupon_code is UNIQUE: inserting the order *is* the redemption.

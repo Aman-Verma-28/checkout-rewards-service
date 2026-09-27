@@ -29,8 +29,9 @@ class ItemBody(Body):
 
 class CheckoutBody(Body):
     coupon_code: str | None = Field(None, max_length=64)
-    # Optional guard: if the total at checkout differs, fail instead of charging it.
-    expected_total_cents: StrictInt | None = Field(None, ge=0)
+    # Optional guard: the subtotal the client showed the customer (GET /carts/{id}).
+    # If prices moved since, checkout fails with PRICE_CHANGED instead of charging the new amount.
+    expected_subtotal_cents: StrictInt | None = Field(None, ge=0)
 
 
 class ProductPatch(Body):
@@ -74,7 +75,7 @@ def remove_item(cart_id: str, product_id: str, request: Request):
 @router.post("/carts/{cart_id}/checkout", status_code=201)
 def checkout(cart_id: str, request: Request, body: CheckoutBody | None = None):
     body = body or CheckoutBody()
-    order, replayed = store(request).checkout(cart_id, body.coupon_code, body.expected_total_cents)
+    order, replayed = store(request).checkout(cart_id, body.coupon_code, body.expected_subtotal_cents)
     if replayed:
         return JSONResponse(order, headers={"Idempotent-Replayed": "true"})
     return JSONResponse(order, status_code=201)
