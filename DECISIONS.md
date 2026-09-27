@@ -1,6 +1,6 @@
 # Decisions
 
-**Approximate time spent:** _TO FILL IN before submission_
+**Approximate time spent:** about 2 hours. That is roughly 40 minutes building and verifying with an AI coding agent (the commit history), plus reading the brief, making the decisions below and reviewing the code and this document.
 
 The CRUD part of this brief is small. The work is in the moments where two things happen at once: a retry arriving while the first attempt is still running, ten customers buying the last three pairs of sneakers, two checkouts holding the same coupon, an admin clicking "generate" twice. So I started from the invariants, placed each one where the database can enforce it, and wrote tests that attack those invariants with overlapping requests.
 
@@ -276,7 +276,7 @@ One envelope, `{"error": {"code", "message", "details"}}`, for everything, inclu
 | Customer identity, per-customer coupons, coupon expiry | No customers exist in the domain yet. Coupons are bearer codes (40 random bits); a production version needs rate limiting against guessing. |
 | Real payment, holds and reservations | Section 8 describes the shape. It changes checkout from one transaction into a small state machine. |
 | Cancellations and refunds | They need a rule for whether a refund un-redeems a coupon or un-counts a milestone, and per-line discount allocation. |
-| Pagination on admin lists | `list_orders` does one query per order (marked `ponytail:` in the code). Fine at this size. |
+| Pagination on admin lists | `list_orders` does one query per order (marked "Known limit" in the code). Fine at this size. |
 | Abandoned-cart cleanup | Carts are tiny rows. A TTL job later. |
 | Schema migrations | `CREATE TABLE IF NOT EXISTS` is enough for a fresh evaluation database. Use a migration tool once the schema has to evolve. |
 | Metrics and structured logs | The first thing I'd add before running this for real (lock wait time, 503 rate, checkout latency). |

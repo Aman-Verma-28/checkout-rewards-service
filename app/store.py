@@ -275,7 +275,7 @@ class Store:
     def list_orders(self) -> list[dict]:
         with self._read() as conn:
             ids = [r["id"] for r in conn.execute("SELECT id FROM orders ORDER BY created_at, id")]
-            # ponytail: one query per order; paginate and join once order volume matters.
+            # Known limit: one query per order. Paginate and join once order volume matters.
             return [self._order_view(conn, i) for i in ids]
 
     def _order_view(self, conn, order_id: str) -> dict:
