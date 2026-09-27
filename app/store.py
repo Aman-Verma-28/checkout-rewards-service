@@ -102,9 +102,112 @@ class Store:
         if order is None:
             raise ApiError(404, "CART_NOT_FOUND", f"Cart {cart_id!r} does not exist.")
         raise ApiError(
-            409, "CART_NOT_OPEN", "Cart is already checked out and can no longer change.",
+            409, "CART_ALREADY_CHECKED_OUT", "Cart is already checked out and can no longer change.",
             order_id=order["id"],
         )
+
+    # ---- checkout -------------------------------------------------------
+
+    def checkout(self, cart_id: str, expected_total_cents: int | None = None) -> tuple[dict, bool]:
+        """Place the order for a cart. Returns (order, replayed).
+
+        One transaction: the cart state change, stock decrements and order snapshot all
+        commit together or not at all, so a failed checkout leaves no trace.
+        The cart is the idempotency key: retrying a checked-out cart returns its order.
+        """
+        with self._write() as conn:
+            claimed = conn.execute(
+                "UPDATE carts SET status = 'checked_out', updated_at = ? WHERE id = ? AND status = 'open'",
+                (_now(), cart_id),
+            ).rowcount
+            if not claimed:
+                return self._replay(conn, cart_id), True
+
+            lines = conn.execute(
+                """SELECT i.product_id, p.name, p.price_cents, p.inventory, i.quantity
+                   FROM cart_items i JOIN products p ON p.id = i.product_id
+                   WHERE i.cart_id = ? ORDER BY i.product_id""",
+                (cart_id,),
+            ).fetchall()
+            if not lines:
+                raise ApiError(422, "CART_EMPTY", "Cannot check out an empty cart.")
+            short = [
+                {"product_id": l["product_id"], "requested": l["quantity"], "available": l["inventory"]}
+                for l in lines if l["quantity"] > l["inventory"]
+            ]
+            if short:
+                raise ApiError(409, "INSUFFICIENT_INVENTORY",
+                               "Some items no longer have enough inventory.", items=short)
+
+            subtotal = sum(l["price_cents"] * l["quantity"] for l in lines)
+            discount = 0
+            total = subtotal - discount
+            if expected_total_cents is not None and expected_total_cents != total:
+                raise ApiError(409, "PRICE_CHANGED",
+                               "The order total differs from the total the client expected.",
+                               expected_total_cents=expected_total_cents, total_cents=total)
+
+            order_id = _id("ord")
+            conn.execute(
+                """INSERT INTO orders (id, cart_id, subtotal_cents, discount_cents, total_cents, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (order_id, cart_id, subtotal, discount, total, _now()),
+            )
+            for l in lines:
+                # Conditional decrement: correct even without the IMMEDIATE lock (e.g. on
+                # Postgres READ COMMITTED), where the check above could be stale.
+                decremented = conn.execute(
+                    "UPDATE products SET inventory = inventory - ? WHERE id = ? AND inventory >= ?",
+                    (l["quantity"], l["product_id"], l["quantity"]),
+                ).rowcount
+                if not decremented:
+                    raise ApiError(409, "INSUFFICIENT_INVENTORY",
+                                   "Some items no longer have enough inventory.",
+                                   items=[{"product_id": l["product_id"], "requested": l["quantity"]}])
+                conn.execute(
+                    """INSERT INTO order_lines
+                       (order_id, product_id, name, unit_price_cents, quantity, line_total_cents)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (order_id, l["product_id"], l["name"], l["price_cents"], l["quantity"],
+                     l["price_cents"] * l["quantity"]),
+                )
+            return self._order_view(conn, order_id), False
+
+    def _replay(self, conn, cart_id: str) -> dict:
+        order = conn.execute("SELECT id FROM orders WHERE cart_id = ?", (cart_id,)).fetchone()
+        if order is None:
+            self._raise_cart_unavailable(conn, cart_id)
+        return self._order_view(conn, order["id"])
+
+    # ---- orders ---------------------------------------------------------
+
+    def get_order(self, order_id: str) -> dict:
+        with self._read() as conn:
+            return self._order_view(conn, order_id)
+
+    def _order_view(self, conn, order_id: str) -> dict:
+        order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+        if order is None:
+            raise ApiError(404, "ORDER_NOT_FOUND", f"Order {order_id!r} does not exist.")
+        lines = conn.execute(
+            """SELECT product_id, name, unit_price_cents, quantity, line_total_cents
+               FROM order_lines WHERE order_id = ? ORDER BY product_id""",
+            (order_id,),
+        )
+        return {
+            "id": order["id"],
+            "cart_id": order["cart_id"],
+            "status": "placed",
+            "lines": [dict(l) for l in lines],
+            "subtotal_cents": order["subtotal_cents"],
+            "coupon_code": order["coupon_code"],
+            "discount_percent": order["discount_percent"],
+            "discount_cents": order["discount_cents"],
+            "total_cents": order["total_cents"],
+            "created_at": order["created_at"],
+        }
+
+    # ---- views ----------------------------------------------------------
 
     def _cart_view(self, conn, cart_id: str) -> dict:
         cart = conn.execute("SELECT id, status, created_at FROM carts WHERE id = ?", (cart_id,)).fetchone()

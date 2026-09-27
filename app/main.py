@@ -26,6 +26,11 @@ class ItemBody(Body):
     quantity: StrictInt = Field(ge=1, le=1000)
 
 
+class CheckoutBody(Body):
+    # Optional guard: if the total at checkout differs, fail instead of charging it.
+    expected_total_cents: StrictInt | None = Field(None, ge=0)
+
+
 # ---- storefront ---------------------------------------------------------
 
 
@@ -52,6 +57,20 @@ def set_item(cart_id: str, product_id: str, body: ItemBody, request: Request):
 @router.delete("/carts/{cart_id}/items/{product_id}")
 def remove_item(cart_id: str, product_id: str, request: Request):
     return store(request).remove_item(cart_id, product_id)
+
+
+@router.post("/carts/{cart_id}/checkout", status_code=201)
+def checkout(cart_id: str, request: Request, body: CheckoutBody | None = None):
+    body = body or CheckoutBody()
+    order, replayed = store(request).checkout(cart_id, body.expected_total_cents)
+    if replayed:
+        return JSONResponse(order, headers={"Idempotent-Replayed": "true"})
+    return JSONResponse(order, status_code=201)
+
+
+@router.get("/orders/{order_id}")
+def get_order(order_id: str, request: Request):
+    return store(request).get_order(order_id)
 
 
 # ---- errors -------------------------------------------------------------
