@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Checkout Demo</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { --bg: #fafaf9; --fg: #1c1917; --muted: #78716c; --card: #fff; --line: #e7e5e4;
+          --ok: #15803d; --err: #b91c1c; --accent: #1d4ed8; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #1c1917; --fg: #f5f5f4; --muted: #a8a29e; --card: #292524; --line: #44403c;
+            --ok: #4ade80; --err: #f87171; --accent: #93c5fd; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 14px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  p.lede { margin: 0 0 16px; color: var(--muted); }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px; min-width: 0; }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { padding: 4px 6px; border-bottom: 1px solid var(--line); text-align: left; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  input { width: 64px; padding: 3px 5px; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; }
+  input.wide { width: 100%; max-width: 220px; }
+  button { padding: 4px 10px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg);
+           color: var(--fg); cursor: pointer; font: inherit; }
+  button.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+  .muted { color: var(--muted); }
+  .ok { color: var(--ok); } .err { color: var(--err); }
+  code { font-size: 12px; overflow-wrap: anywhere; }
+  #log { list-style: none; padding: 0; margin: 0; max-height: 320px; overflow: auto; font-size: 13px; }
+  #log li { padding: 3px 0; border-bottom: 1px solid var(--line); cursor: help; overflow-wrap: anywhere; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; }
+  .kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<h1>Checkout &amp; Rewards Service</h1>
+<p class="lede">A thin client over the API. Hover a log line to see the full response body. API docs: <a href="/docs">/docs</a></p>
+
+<div class="grid">
+  <section>
+    <h2>Products</h2>
+    <table><thead><tr><th>Product</th><th class="num">Price</th><th class="num">Stock</th><th>Qty</th><th></th></tr></thead>
+      <tbody id="products"></tbody></table>
+  </section>
+
+  <section>
+    <h2>Cart</h2>
+    <div class="row"><button id="new-cart">New cart</button><code id="cart-id" class="muted"></code></div>
+    <table><tbody id="cart"></tbody></table>
+    <div class="row"><input id="coupon" class="wide" placeholder="Coupon code (optional)">
+      <button id="checkout" class="primary">Checkout</button>
+      <button id="retry" disabled title="Send the identical checkout request again">Retry checkout</button></div>
+    <div id="order" class="muted"></div>
+  </section>
+
+  <section>
+    <h2>Concurrency demo</h2>
+    <p class="muted">Creates 10 carts with one Limited Edition Sneaker each and sends all 10 checkouts at once.</p>
+    <div class="row"><button id="race" class="primary">Race 10 checkouts</button>
+      <button id="restock">Restock sneakers to 3</button></div>
+    <div id="race-result"></div>
+  </section>
+
+  <section>
+    <h2>Admin</h2>
+    <div class="row"><button id="gen">Generate coupon</button><span id="gen-result"></span></div>
+    <dl class="kv" id="report"></dl>
+  </section>
+
+  <section>
+    <h2>Request log</h2>
+    <ul id="log"></ul>
+  </section>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const money = (c) => `${c < 0 ? "-" : ""}$${Math.floor(Math.abs(c) / 100)}.${String(Math.abs(c) % 100).padStart(2, "0")}`;
+const el = (tag, text, cls) => { const e = document.createElement(tag); if (text !== undefined) e.textContent = text; if (cls) e.className = cls; return e; };
+let cartId = null, lastCheckout = null;
+
+async function call(method, path, body, quiet) {
+  const res = await fetch(path, { method, headers: body ? { "Content-Type": "application/json" } : {},
+                                  body: body ? JSON.stringify(body) : undefined });
+  const r = { status: res.status, replayed: res.headers.get("Idempotent-Replayed") === "true", data: await res.json() };
+  if (!quiet) log(`${method} ${path}`, r);
+  return r;
+}
+
+function log(label, r) {
+  const li = el("li", "", r.status < 300 ? "ok" : "err");
+  li.append(el("b", `${r.status} `), `${label} `, el("span", r.data.error ? r.data.error.code : r.replayed ? "replayed" : "", "muted"));
+  li.title = JSON.stringify(r.data, null, 2);
+  $("#log").prepend(li);
+}
+
+async function refreshProducts() {
+  const { data } = await call("GET", "/products", null, true);
+  $("#products").replaceChildren(...data.map((p) => {
+    const tr = el("tr"), qty = el("input"), add = el("button", "Set");
+    qty.type = "number"; qty.min = 1; qty.value = 1;
+    add.onclick = async () => { await ensureCart(); await call("PUT", `/carts/${cartId}/items/${p.id}`, { quantity: Number(qty.value) }); refresh(); };
+    tr.append(el("td", p.name), el("td", money(p.price_cents), "num"), el("td", p.inventory, "num"));
+    const a = el("td"), b = el("td"); a.append(qty); b.append(add); tr.append(a, b);
+    return tr;
+  }));
+}
+
+async function ensureCart() { if (!cartId) await newCart(); }
+async function newCart() {
+  cartId = (await call("POST", "/carts")).data.id; lastCheckout = null;
+  $("#retry").disabled = true; $("#order").textContent = ""; refresh();
+}
+
+async function refreshCart() {
+  $("#cart-id").textContent = cartId || "no cart yet";
+  if (!cartId) return $("#cart").replaceChildren();
+  const { data } = await call("GET", `/carts/${cartId}`, null, true);
+  const rows = data.items.map((i) => {
+    const tr = el("tr"), rm = el("button", "Remove"), td = el("td");
+    rm.onclick = async () => { await call("DELETE", `/carts/${cartId}/items/${i.product_id}`); refresh(); };
+    td.append(rm);
+    tr.append(el("td", `${i.name}${i.available ? "" : " (not enough stock)"}`, i.available ? "" : "err"),
+              el("td", `${i.quantity} × ${money(i.unit_price_cents)}`, "num"), el("td", money(i.line_total_cents), "num"), td);
+    return tr;
+  });
+  const total = el("tr"); total.append(el("td", `Subtotal · ${data.status}`), el("td"), el("td", money(data.subtotal_cents), "num"), el("td"));
+  $("#cart").replaceChildren(...rows, total);
+}
+
+async function checkout(body) {
+  const r = await call("POST", `/carts/${cartId}/checkout`, body);
+  lastCheckout = body; $("#retry").disabled = false;
+  const o = r.data;
+  $("#order").textContent = r.status < 300
+    ? `${r.replayed ? "Replayed" : "Placed"} order ${o.id}: ${money(o.subtotal_cents)} − ${money(o.discount_cents)} (${o.discount_percent}%) = ${money(o.total_cents)}`
+    : `${o.error.code}: ${o.error.message}`;
+  $("#order").className = r.status < 300 ? "ok" : "err";
+  refresh();
+}
+
+async function race() {
+  $("#race-result").textContent = "Running…";
+  const before = (await call("GET", "/products", null, true)).data.find((p) => p.id === "sneakers-ltd").inventory;
+  const carts = [];
+  for (let i = 0; i < 10; i++) {
+    const id = (await call("POST", "/carts", null, true)).data.id;
+    const r = await call("PUT", `/carts/${id}/items/sneakers-ltd`, { quantity: 1 }, true);
+    if (r.status === 200) carts.push(id);
+  }
+  if (!carts.length) { $("#race-result").textContent = "Sneakers are sold out: restock first."; return; }
+  const results = await Promise.all(carts.map((id) => call("POST", `/carts/${id}/checkout`)));
+  const tally = {};
+  results.forEach((r) => { const k = r.status < 300 ? `${r.status} placed` : `${r.status} ${r.data.error.code}`; tally[k] = (tally[k] || 0) + 1; });
+  const after = (await call("GET", "/products", null, true)).data.find((p) => p.id === "sneakers-ltd").inventory;
+  $("#race-result").textContent = `Stock ${before} → ${after}. ` + Object.entries(tally).map(([k, v]) => `${v}× ${k}`).join(", ");
+  refresh();
+}
+
+async function refreshReport() {
+  const { data: r } = await call("GET", "/admin/report", null, true);
+  const kv = [["Orders placed", r.orders_placed], ["Gross revenue", money(r.gross_revenue_cents)],
+    ["Discounts", money(r.total_discount_cents)], ["Net revenue", money(r.net_revenue_cents)],
+    ["Coupons generated / available / redeemed", `${r.coupons.generated} / ${r.coupons.available} / ${r.coupons.redeemed}`],
+    [`Next milestone (every ${r.rewards.every_n}, ${r.rewards.percent}% off)`, `order #${r.rewards.next_milestone}`],
+    ...r.products.filter((p) => p.quantity_sold).map((p) => [`Sold: ${p.name}`, p.quantity_sold])];
+  $("#report").replaceChildren(...kv.flatMap(([k, v]) => [el("dt", k), el("dd", v)]));
+}
+
+function refresh() { refreshProducts(); refreshCart(); refreshReport(); }
+
+$("#new-cart").onclick = newCart;
+$("#checkout").onclick = async () => { await ensureCart(); checkout($("#coupon").value ? { coupon_code: $("#coupon").value } : null); };
+$("#retry").onclick = () => checkout(lastCheckout);
+$("#race").onclick = race;
+$("#restock").onclick = async () => { await call("PATCH", "/admin/products/sneakers-ltd", { inventory: 3 }); refresh(); };
+$("#gen").onclick = async () => {
+  const r = await call("POST", "/admin/coupons");
+  $("#gen-result").textContent = r.status === 201 ? r.data.code : r.data.error.message;
+  $("#gen-result").className = r.status === 201 ? "ok" : "err";
+  if (r.status === 201) $("#coupon").value = r.data.code;
+  refresh();
+};
+refresh();
+</script>
+</body>
+</html>

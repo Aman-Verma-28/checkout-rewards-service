@@ -2,10 +2,11 @@
 import os
 import sqlite3
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -38,6 +39,11 @@ class ProductPatch(Body):
 
 
 # ---- storefront ---------------------------------------------------------
+
+
+@router.get("/", include_in_schema=False)
+def demo():
+    return FileResponse(Path(__file__).with_name("demo.html"))
 
 
 @router.get("/products")
